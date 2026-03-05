@@ -63,10 +63,10 @@ jobs:
                   set -euo pipefail
                   branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
                   if [[ "$branch" == release/* ]]; then
-                    echo 'labels=["self-hosted","Linux","X64","blacksmith-4vcpu-ubuntu-2404"]' >> "$GITHUB_OUTPUT"
+                    echo 'labels=["self-hosted","Linux","X64","blacksmith-2vcpu-ubuntu-2404"]' >> "$GITHUB_OUTPUT"
                     echo 'lane=release' >> "$GITHUB_OUTPUT"
                   else
-                    echo 'labels=["self-hosted","Linux","X64","blacksmith-4vcpu-ubuntu-2404"]' >> "$GITHUB_OUTPUT"
+                    echo 'labels=["self-hosted","Linux","X64","blacksmith-2vcpu-ubuntu-2404"]' >> "$GITHUB_OUTPUT"
                     echo 'lane=general' >> "$GITHUB_OUTPUT"
                   fi
 

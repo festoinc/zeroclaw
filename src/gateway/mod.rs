@@ -2492,11 +2492,11 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
         };
 
-        let response = handle_nextcloud_talk_webhook(
+        let response = Box::pin(handle_nextcloud_talk_webhook(
             State(state),
             HeaderMap::new(),
             Bytes::from_static(br#"{"type":"message"}"#),
-        )
+        ))
         .await
         .into_response();
 
@@ -2558,7 +2558,7 @@ mod tests {
             HeaderValue::from_str(invalid_signature).unwrap(),
         );
 
-        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
+        let response = Box::pin(handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body)))
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

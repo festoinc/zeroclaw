@@ -302,4 +302,296 @@ mod tests {
         assert!(stored.ends_with(TRUNCATED_MARKER));
         assert!(stored.len() <= MAX_OUTPUT_BYTES);
     }
+
+    #[test]
+    fn list_runs_empty_db() {
+        let tmp = TempDir::new().unwrap();
+        let runs = list_runs(tmp.path(), 10).unwrap();
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn run_stats_empty_db() {
+        let tmp = TempDir::new().unwrap();
+        let (total, ok, err) = run_stats(tmp.path()).unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(ok, 0);
+        assert_eq!(err, 0);
+    }
+
+    #[test]
+    fn record_run_with_none_output() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        record_run(tmp.path(), "T", "medium", now, now, "ok", None, 10, 50).unwrap();
+
+        let runs = list_runs(tmp.path(), 1).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].output.is_none());
+    }
+
+    #[test]
+    fn record_run_max_history_one() {
+        let tmp = TempDir::new().unwrap();
+        let base = Utc::now();
+
+        for i in 0..5 {
+            let start = base + ChronoDuration::seconds(i);
+            let end = start + ChronoDuration::milliseconds(10);
+            record_run(
+                tmp.path(),
+                &format!("Task {i}"),
+                "medium",
+                start,
+                end,
+                "ok",
+                None,
+                10,
+                1, // keep only 1
+            )
+            .unwrap();
+        }
+
+        let runs = list_runs(tmp.path(), 10).unwrap();
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn truncate_output_exactly_at_limit() {
+        let exact = "x".repeat(MAX_OUTPUT_BYTES);
+        let result = truncate_output(&exact);
+        assert_eq!(result.len(), MAX_OUTPUT_BYTES);
+        assert!(!result.contains(TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn truncate_output_one_byte_over() {
+        let over = "x".repeat(MAX_OUTPUT_BYTES + 1);
+        let result = truncate_output(&over);
+        assert!(result.ends_with(TRUNCATED_MARKER));
+        assert!(result.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn truncate_output_multibyte_boundary() {
+        // Build a string of multi-byte chars that crosses the cutoff boundary
+        // Each '€' is 3 bytes in UTF-8
+        let euro_count = MAX_OUTPUT_BYTES / 3 + 10;
+        let input: String = "€".repeat(euro_count);
+        let result = truncate_output(&input);
+        // Must be valid UTF-8 and end with the marker
+        assert!(result.ends_with(TRUNCATED_MARKER));
+        // Verify it's valid UTF-8 (would panic if not)
+        let _ = result.as_str();
+    }
+
+    // ── truncate_output additional edge cases ────────────────────
+
+    #[test]
+    fn truncate_output_empty_string() {
+        let result = truncate_output("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn truncate_output_single_char() {
+        let result = truncate_output("x");
+        assert_eq!(result, "x");
+    }
+
+    #[test]
+    fn truncate_output_shorter_than_marker() {
+        let result = truncate_output("short");
+        assert_eq!(result, "short");
+        assert!(!result.contains(TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn truncate_output_4byte_utf8_boundary() {
+        // '𝄞' is 4 bytes in UTF-8 — test char boundary handling with 4-byte chars
+        let count = MAX_OUTPUT_BYTES / 4 + 10;
+        let input: String = "𝄞".repeat(count);
+        let result = truncate_output(&input);
+        assert!(result.ends_with(TRUNCATED_MARKER));
+        // Must remain valid UTF-8
+        let _ = result.as_str();
+    }
+
+    // ── record_run additional edge cases ─────────────────────────
+
+    #[test]
+    fn record_run_empty_string_output() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        record_run(tmp.path(), "T", "medium", now, now, "ok", Some(""), 10, 50).unwrap();
+
+        let runs = list_runs(tmp.path(), 1).unwrap();
+        assert_eq!(runs.len(), 1);
+        // Empty string is stored as Some(""), not None
+        assert_eq!(runs[0].output.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn record_run_special_chars_in_task_text() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        let special = "Task with 'quotes', \"doubles\", and SQL: DROP TABLE; --";
+        record_run(tmp.path(), special, "high", now, now, "ok", None, 10, 50).unwrap();
+
+        let runs = list_runs(tmp.path(), 1).unwrap();
+        assert_eq!(runs[0].task_text, special);
+    }
+
+    #[test]
+    fn record_run_zero_duration() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        record_run(tmp.path(), "T", "medium", now, now, "ok", None, 0, 50).unwrap();
+
+        let runs = list_runs(tmp.path(), 1).unwrap();
+        assert_eq!(runs[0].duration_ms, 0);
+    }
+
+    #[test]
+    fn record_run_negative_duration() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        // Negative duration shouldn't panic — SQLite stores it fine
+        record_run(tmp.path(), "T", "medium", now, now, "ok", None, -1, 50).unwrap();
+
+        let runs = list_runs(tmp.path(), 1).unwrap();
+        assert_eq!(runs[0].duration_ms, -1);
+    }
+
+    #[test]
+    fn record_run_unicode_output() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        let unicode_output = "日本語の結果 🎉 €100";
+        record_run(
+            tmp.path(),
+            "T",
+            "medium",
+            now,
+            now,
+            "ok",
+            Some(unicode_output),
+            10,
+            50,
+        )
+        .unwrap();
+
+        let runs = list_runs(tmp.path(), 1).unwrap();
+        assert_eq!(runs[0].output.as_deref(), Some(unicode_output));
+    }
+
+    // ── list_runs additional edge cases ──────────────────────────
+
+    #[test]
+    fn list_runs_limit_clamped_to_one() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        for i in 0..3 {
+            let start = now + ChronoDuration::seconds(i);
+            record_run(
+                tmp.path(),
+                &format!("T{i}"),
+                "medium",
+                start,
+                start,
+                "ok",
+                None,
+                10,
+                50,
+            )
+            .unwrap();
+        }
+        // limit=0 is clamped to 1
+        let runs = list_runs(tmp.path(), 0).unwrap();
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn list_runs_ordering_same_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        // Insert multiple runs with the same timestamp
+        for i in 0..3 {
+            record_run(
+                tmp.path(),
+                &format!("Task {i}"),
+                "medium",
+                now,
+                now,
+                "ok",
+                None,
+                10,
+                50,
+            )
+            .unwrap();
+        }
+        let runs = list_runs(tmp.path(), 10).unwrap();
+        assert_eq!(runs.len(), 3);
+        // With same timestamp, ordered by id DESC → Task 2 first
+        assert!(runs[0].task_text.contains('2'));
+        assert!(runs[2].task_text.contains('0'));
+    }
+
+    // ── run_stats additional edge cases ──────────────────────────
+
+    #[test]
+    fn run_stats_only_errors() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        record_run(tmp.path(), "A", "high", now, now, "error", None, 10, 50).unwrap();
+        record_run(tmp.path(), "B", "high", now, now, "error", None, 10, 50).unwrap();
+
+        let (total, ok, err) = run_stats(tmp.path()).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(ok, 0);
+        assert_eq!(err, 2);
+    }
+
+    #[test]
+    fn run_stats_only_ok() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        record_run(tmp.path(), "A", "high", now, now, "ok", None, 10, 50).unwrap();
+        record_run(tmp.path(), "B", "high", now, now, "ok", None, 10, 50).unwrap();
+
+        let (total, ok, err) = run_stats(tmp.path()).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(ok, 2);
+        assert_eq!(err, 0);
+    }
+
+    #[test]
+    fn record_run_max_history_keeps_most_recent() {
+        let tmp = TempDir::new().unwrap();
+        let base = Utc::now();
+
+        for i in 0..5 {
+            let start = base + ChronoDuration::seconds(i);
+            let end = start + ChronoDuration::milliseconds(10);
+            record_run(
+                tmp.path(),
+                &format!("Task {i}"),
+                "medium",
+                start,
+                end,
+                "ok",
+                None,
+                10,
+                3,
+            )
+            .unwrap();
+        }
+
+        let runs = list_runs(tmp.path(), 10).unwrap();
+        assert_eq!(runs.len(), 3);
+        // Most recent 3 should be Task 4, 3, 2
+        assert!(runs[0].task_text.contains('4'));
+        assert!(runs[1].task_text.contains('3'));
+        assert!(runs[2].task_text.contains('2'));
+    }
 }

@@ -323,6 +323,66 @@ impl HeartbeatEngine {
         (priority, status)
     }
 
+    /// Build a structured, non-conversational prompt for Phase 2 task execution.
+    pub fn build_task_prompt(task: &HeartbeatTask, prompt_prefix: Option<&str>) -> String {
+        let mut prompt = String::new();
+
+        if let Some(prefix) = prompt_prefix {
+            prompt.push_str(prefix);
+            prompt.push_str("\n\n");
+        }
+
+        use std::fmt::Write;
+        let _ = write!(
+            prompt,
+            "You are executing a periodic automated task. You are NOT in a conversation.\n\n\
+             ## Task\n{}\n\n\
+             ## Priority\n{}\n\n\
+             ## Instructions\n\
+             - Execute this task using available tools (shell, file_read, memory, browser, etc.)\n\
+             - Report results as a structured brief\n\
+             - Format:\n\
+             \x20 **Status:** [completed | partial | failed]\n\
+             \x20 **Summary:** [1-2 sentences]\n\
+             \x20 **Details:** [bullet points of findings/actions]\n\
+             \x20 **Next action:** [follow-up or \"none\"]\n\
+             - Do NOT greet, ask questions, or use conversational filler\n\
+             - Be direct and factual\n\n\
+             ## Memory\n\
+             - Use memory_search to check previous findings for this task\n\
+             - Use memory_store to save important findings for future ticks",
+            task.text, task.priority
+        );
+
+        prompt
+    }
+
+    /// Format raw agent output for channel delivery.
+    ///
+    /// Prepends a header, handles empty output, and truncates for safety.
+    pub fn format_delivery_output(raw: &str, task: &HeartbeatTask) -> String {
+        const MAX_DELIVERY_CHARS: usize = 4096;
+
+        let header = format!("[{}] {}", task.priority, task.text);
+        let body = raw.trim();
+        let body = if body.is_empty() {
+            "Task completed (no output)"
+        } else {
+            body
+        };
+
+        let mut output = format!("{header}\n\n{body}");
+        if output.len() > MAX_DELIVERY_CHARS {
+            // Truncate at a char boundary
+            let mut cutoff = MAX_DELIVERY_CHARS;
+            while cutoff > 0 && !output.is_char_boundary(cutoff) {
+                cutoff -= 1;
+            }
+            output.truncate(cutoff);
+        }
+        output
+    }
+
     /// Build the Phase 1 LLM decision prompt for two-phase heartbeat.
     pub fn build_decision_prompt(tasks: &[HeartbeatTask]) -> String {
         let mut prompt = String::from(
@@ -344,7 +404,8 @@ impl HeartbeatEngine {
             "\nRespond with ONLY one of:\n\
              - `run: 1,2,3` (comma-separated task numbers to execute)\n\
              - `skip` (nothing needs to run right now)\n\n\
-             Be conservative — skip if tasks are routine and not time-sensitive.",
+             Be conservative — skip if tasks are routine and not time-sensitive.\n\n\
+             Do not explain your reasoning. Respond with ONLY the directive.",
         );
 
         prompt
@@ -849,5 +910,736 @@ mod tests {
             HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer);
         let metrics = engine.metrics();
         assert_eq!(metrics.lock().total_ticks, 0);
+    }
+
+    // ── Malformed metadata parsing edge cases ───────────────────
+
+    #[test]
+    fn parse_meta_empty_brackets() {
+        let tasks = HeartbeatEngine::parse_tasks("- [] Task");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+        assert_eq!(tasks[0].text, "Task");
+    }
+
+    #[test]
+    fn parse_meta_pipe_only() {
+        let tasks = HeartbeatEngine::parse_tasks("- [|] Task");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+        assert_eq!(tasks[0].text, "Task");
+    }
+
+    #[test]
+    fn parse_meta_high_pipe_empty() {
+        let tasks = HeartbeatEngine::parse_tasks("- [high|] Task");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::High);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+    }
+
+    #[test]
+    fn parse_meta_pipe_paused() {
+        let tasks = HeartbeatEngine::parse_tasks("- [|paused] Task");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+        assert_eq!(tasks[0].status, TaskStatus::Paused);
+    }
+
+    #[test]
+    fn parse_meta_unknown_tag() {
+        let tasks = HeartbeatEngine::parse_tasks("- [unknown] Task");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+        assert_eq!(tasks[0].text, "Task");
+    }
+
+    #[test]
+    fn parse_meta_case_insensitive() {
+        let tasks = HeartbeatEngine::parse_tasks("- [HIGH|PAUSED] Task");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::High);
+        assert_eq!(tasks[0].status, TaskStatus::Paused);
+    }
+
+    #[test]
+    fn parse_task_line_unclosed_bracket() {
+        let tasks = HeartbeatEngine::parse_tasks("- [high Task");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+        assert_eq!(tasks[0].text, "[high Task");
+    }
+
+    #[test]
+    fn parse_task_line_nested_brackets() {
+        let tasks = HeartbeatEngine::parse_tasks("- [high] [extra] Task");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::High);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+        assert_eq!(tasks[0].text, "[extra] Task");
+    }
+
+    #[test]
+    fn parse_task_line_metadata_empty_text_after_trim() {
+        // When text after bracket is empty/whitespace, falls back to plain text
+        let tasks = HeartbeatEngine::parse_tasks("- [high] ");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+        assert_eq!(tasks[0].text, "[high]");
+    }
+
+    #[test]
+    fn parse_meta_multiple_pipes() {
+        let tasks = HeartbeatEngine::parse_tasks("- [high|active|low] Task");
+        assert_eq!(tasks.len(), 1);
+        // Last priority wins: high then low → low
+        assert_eq!(tasks[0].priority, TaskPriority::Low);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+    }
+
+    // ── Decision response parsing edge cases ────────────────────
+
+    #[test]
+    fn parse_decision_empty_response() {
+        let indices = HeartbeatEngine::parse_decision_response("", 3);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_run_with_extra_spaces() {
+        let indices = HeartbeatEngine::parse_decision_response("run:  1 , 2 , 3 ", 5);
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn parse_decision_run_space_variant() {
+        let indices = HeartbeatEngine::parse_decision_response("run 1,2", 5);
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn parse_decision_all_out_of_range() {
+        let indices = HeartbeatEngine::parse_decision_response("run: 99,100", 3);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_verbose_skip() {
+        // "I think we should skip" doesn't start with "skip" exactly,
+        // parse as bare numbers fails → empty (documents limitation)
+        let indices = HeartbeatEngine::parse_decision_response("I think we should skip", 3);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_verbose_run_buried() {
+        // "Based on analysis, run: 1,2" — bare number parse picks up "2" from
+        // comma-split, so this partially works (documents limitation).
+        let indices = HeartbeatEngine::parse_decision_response("Based on analysis, run: 1,2", 3);
+        // Only "2" parses as a valid number from the comma-split fragments
+        assert_eq!(indices, vec![1]);
+    }
+
+    // ── Metrics edge cases ──────────────────────────────────────
+
+    #[test]
+    fn metrics_ema_zero_duration() {
+        let mut m = HeartbeatMetrics::default();
+        m.record_success(0.0);
+        assert!(!m.avg_tick_duration_ms.is_nan());
+        assert_eq!(m.avg_tick_duration_ms, 0.0);
+    }
+
+    #[test]
+    fn metrics_ema_very_large_duration() {
+        let mut m = HeartbeatMetrics::default();
+        m.record_success(f64::MAX / 2.0);
+        assert!(!m.avg_tick_duration_ms.is_infinite());
+        assert!(!m.avg_tick_duration_ms.is_nan());
+    }
+
+    #[test]
+    fn metrics_concurrent_access() {
+        let metrics = Arc::new(ParkingMutex::new(HeartbeatMetrics::default()));
+        let threads: Vec<_> = (0..4)
+            .map(|i| {
+                let m = Arc::clone(&metrics);
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        let mut lock = m.lock();
+                        if i % 2 == 0 {
+                            lock.record_success(1.0);
+                        } else {
+                            lock.record_failure(1.0);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(metrics.lock().total_ticks, 400);
+    }
+
+    #[test]
+    fn adaptive_interval_large_failure_count() {
+        // consecutive_failures=20 → saturating_mul shouldn't overflow
+        let result = compute_adaptive_interval(30, 5, 120, 20, false);
+        assert!(result <= 120);
+        assert!(result >= 5);
+    }
+
+    // ── build_task_prompt tests ─────────────────────────────────
+
+    #[test]
+    fn build_task_prompt_contains_task_text() {
+        let task = HeartbeatTask {
+            text: "Check email inbox".into(),
+            priority: TaskPriority::High,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, None);
+        assert!(prompt.contains("Check email inbox"));
+    }
+
+    #[test]
+    fn build_task_prompt_contains_no_greeting_instruction() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, None);
+        assert!(prompt.contains("Do NOT greet"));
+    }
+
+    #[test]
+    fn build_task_prompt_contains_structured_format() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, None);
+        assert!(prompt.contains("**Status:**"));
+        assert!(prompt.contains("**Summary:**"));
+        assert!(prompt.contains("**Details:**"));
+        assert!(prompt.contains("**Next action:**"));
+    }
+
+    #[test]
+    fn build_task_prompt_with_custom_prefix() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Low,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, Some("CUSTOM PREFIX"));
+        assert!(prompt.starts_with("CUSTOM PREFIX"));
+        assert!(prompt.contains("Task"));
+    }
+
+    // ── format_delivery_output tests ────────────────────────────
+
+    #[test]
+    fn format_delivery_output_adds_header() {
+        let task = HeartbeatTask {
+            text: "Check email".into(),
+            priority: TaskPriority::High,
+            status: TaskStatus::Active,
+        };
+        let output = HeartbeatEngine::format_delivery_output("Some result", &task);
+        assert!(output.starts_with("[high] Check email"));
+        assert!(output.contains("Some result"));
+    }
+
+    #[test]
+    fn format_delivery_output_handles_empty() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let output = HeartbeatEngine::format_delivery_output("   ", &task);
+        assert!(output.contains("Task completed (no output)"));
+    }
+
+    #[test]
+    fn format_delivery_output_truncates_long_output() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let long = "x".repeat(5000);
+        let output = HeartbeatEngine::format_delivery_output(&long, &task);
+        assert!(output.len() <= 4096);
+    }
+
+    // ── parse_meta alias coverage ───────────────────────────────
+
+    #[test]
+    fn parse_meta_med_alias() {
+        let tasks = HeartbeatEngine::parse_tasks("- [med] Task");
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+    }
+
+    #[test]
+    fn parse_meta_pause_alias() {
+        let tasks = HeartbeatEngine::parse_tasks("- [pause] Task");
+        assert_eq!(tasks[0].status, TaskStatus::Paused);
+    }
+
+    #[test]
+    fn parse_meta_complete_alias() {
+        let tasks = HeartbeatEngine::parse_tasks("- [complete] Task");
+        assert_eq!(tasks[0].status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn parse_meta_done_alias() {
+        let tasks = HeartbeatEngine::parse_tasks("- [done] Task");
+        assert_eq!(tasks[0].status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn parse_meta_whitespace_around_pipes() {
+        let tasks = HeartbeatEngine::parse_tasks("- [ high | paused ] Task");
+        assert_eq!(tasks[0].priority, TaskPriority::High);
+        assert_eq!(tasks[0].status, TaskStatus::Paused);
+    }
+
+    #[test]
+    fn parse_task_line_whitespace_inside_brackets() {
+        let tasks = HeartbeatEngine::parse_tasks("- [  ] Task");
+        assert_eq!(tasks[0].priority, TaskPriority::Medium);
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+        assert_eq!(tasks[0].text, "Task");
+    }
+
+    // ── parse_tasks line ending / whitespace edge cases ─────────
+
+    #[test]
+    fn parse_tasks_crlf_line_endings() {
+        let content = "- Task A\r\n- Task B\r\n- Task C";
+        let tasks = HeartbeatEngine::parse_tasks(content);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].text, "Task A");
+        assert_eq!(tasks[2].text, "Task C");
+    }
+
+    #[test]
+    fn parse_tasks_consecutive_empty_lines() {
+        let content = "- A\n\n\n\n- B";
+        let tasks = HeartbeatEngine::parse_tasks(content);
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn parse_tasks_whitespace_only_lines() {
+        let content = "- A\n   \n\t\n- B";
+        let tasks = HeartbeatEngine::parse_tasks(content);
+        assert_eq!(tasks.len(), 2);
+    }
+
+    // ── parse_decision_response additional edge cases ────────────
+
+    #[test]
+    fn parse_decision_task_count_zero() {
+        let indices = HeartbeatEngine::parse_decision_response("run: 1", 0);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_uppercase_run() {
+        // Input gets lowercased, so "RUN: 1,2" → "run: 1,2"
+        let indices = HeartbeatEngine::parse_decision_response("RUN: 1,2", 3);
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn parse_decision_uppercase_skip() {
+        let indices = HeartbeatEngine::parse_decision_response("SKIP", 3);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_duplicate_indices() {
+        let indices = HeartbeatEngine::parse_decision_response("run: 1,1,1", 3);
+        assert_eq!(indices, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn parse_decision_negative_numbers() {
+        let indices = HeartbeatEngine::parse_decision_response("run: -1,2", 3);
+        // "-1" fails to parse as usize → filtered out; "2" parses fine
+        assert_eq!(indices, vec![1]);
+    }
+
+    #[test]
+    fn parse_decision_decimal_numbers() {
+        let indices = HeartbeatEngine::parse_decision_response("run: 1.5,2", 3);
+        // "1.5" fails to parse as usize → filtered; "2" works
+        assert_eq!(indices, vec![1]);
+    }
+
+    #[test]
+    fn parse_decision_whitespace_only() {
+        let indices = HeartbeatEngine::parse_decision_response("   ", 3);
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_run_colon_no_numbers() {
+        let indices = HeartbeatEngine::parse_decision_response("run: ", 3);
+        assert!(indices.is_empty());
+    }
+
+    // ── compute_adaptive_interval boundary conditions ────────────
+
+    #[test]
+    fn adaptive_base_zero() {
+        // base=0 → clamped to [min, max]
+        let result = compute_adaptive_interval(0, 5, 120, 0, false);
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed: min <= max")]
+    fn adaptive_min_greater_than_max_panics() {
+        // min > max → clamp panics (documents Rust stdlib behavior)
+        compute_adaptive_interval(30, 120, 5, 0, false);
+    }
+
+    #[test]
+    fn adaptive_min_equals_max_equals_base() {
+        let result = compute_adaptive_interval(30, 30, 30, 0, false);
+        assert_eq!(result, 30);
+    }
+
+    #[test]
+    fn adaptive_failures_u64_max() {
+        // u64::MAX failures → should not panic; capped at shift=10
+        let result = compute_adaptive_interval(30, 5, 120, u64::MAX, false);
+        assert!(result <= 120);
+        assert!(result >= 5);
+    }
+
+    #[test]
+    fn adaptive_high_priority_with_min_below_five() {
+        // min=2 but high priority enforces >= 5
+        let result = compute_adaptive_interval(30, 2, 120, 0, true);
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn adaptive_high_priority_with_min_above_five() {
+        let result = compute_adaptive_interval(30, 10, 120, 0, true);
+        assert_eq!(result, 10);
+    }
+
+    #[test]
+    fn adaptive_failure_backoff_exactly_at_max() {
+        // 2 failures: 30 * 4 = 120 exactly at max
+        let result = compute_adaptive_interval(30, 5, 120, 2, false);
+        assert_eq!(result, 120);
+    }
+
+    // ── Metrics additional edge cases ───────────────────────────
+
+    #[test]
+    fn metrics_ema_nan_input() {
+        let mut m = HeartbeatMetrics::default();
+        m.record_success(f64::NAN);
+        // NaN propagates in EMA; verify no panic
+        assert!(m.avg_tick_duration_ms.is_nan());
+    }
+
+    #[test]
+    fn metrics_ema_negative_duration() {
+        let mut m = HeartbeatMetrics::default();
+        m.record_success(-50.0);
+        // Negative is accepted without panic
+        assert_eq!(m.avg_tick_duration_ms, -50.0);
+    }
+
+    #[test]
+    fn metrics_interleaved_success_failure() {
+        let mut m = HeartbeatMetrics::default();
+        m.record_success(10.0);
+        assert_eq!(m.consecutive_successes, 1);
+        assert_eq!(m.consecutive_failures, 0);
+
+        m.record_failure(20.0);
+        assert_eq!(m.consecutive_successes, 0);
+        assert_eq!(m.consecutive_failures, 1);
+
+        m.record_success(30.0);
+        assert_eq!(m.consecutive_successes, 1);
+        assert_eq!(m.consecutive_failures, 0);
+
+        m.record_failure(40.0);
+        m.record_failure(50.0);
+        assert_eq!(m.consecutive_successes, 0);
+        assert_eq!(m.consecutive_failures, 2);
+        assert_eq!(m.total_ticks, 5);
+    }
+
+    #[test]
+    fn metrics_default_values() {
+        let m = HeartbeatMetrics::default();
+        assert_eq!(m.uptime_secs, 0);
+        assert_eq!(m.consecutive_successes, 0);
+        assert_eq!(m.consecutive_failures, 0);
+        assert!(m.last_tick_at.is_none());
+        assert_eq!(m.avg_tick_duration_ms, 0.0);
+        assert_eq!(m.total_ticks, 0);
+    }
+
+    // ── build_task_prompt additional tests ───────────────────────
+
+    #[test]
+    fn build_task_prompt_embeds_priority() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::High,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, None);
+        assert!(prompt.contains("## Priority\nhigh"));
+    }
+
+    #[test]
+    fn build_task_prompt_embeds_low_priority() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Low,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, None);
+        assert!(prompt.contains("## Priority\nlow"));
+    }
+
+    #[test]
+    fn build_task_prompt_contains_memory_instructions() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, None);
+        assert!(prompt.contains("memory_search"));
+        assert!(prompt.contains("memory_store"));
+    }
+
+    #[test]
+    fn build_task_prompt_contains_not_in_conversation() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, None);
+        assert!(prompt.contains("NOT in a conversation"));
+    }
+
+    #[test]
+    fn build_task_prompt_empty_prefix() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, Some(""));
+        // Empty prefix still prepends the "\n\n" separator
+        assert!(prompt.starts_with("\n\n"));
+    }
+
+    #[test]
+    fn build_task_prompt_unicode_task() {
+        let task = HeartbeatTask {
+            text: "日本語タスク 📧".into(),
+            priority: TaskPriority::High,
+            status: TaskStatus::Active,
+        };
+        let prompt = HeartbeatEngine::build_task_prompt(&task, None);
+        assert!(prompt.contains("日本語タスク 📧"));
+    }
+
+    // ── format_delivery_output additional tests ─────────────────
+
+    #[test]
+    fn format_delivery_output_newline_only_raw() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let output = HeartbeatEngine::format_delivery_output("\n\n\n", &task);
+        assert!(output.contains("Task completed (no output)"));
+    }
+
+    #[test]
+    fn format_delivery_output_exactly_at_limit() {
+        let task = HeartbeatTask {
+            text: "T".into(),
+            priority: TaskPriority::Low,
+            status: TaskStatus::Active,
+        };
+        // Header is "[low] T\n\n" = 10 chars, fill remaining to exactly 4096
+        let header_len = "[low] T\n\n".len();
+        let body = "x".repeat(4096 - header_len);
+        let output = HeartbeatEngine::format_delivery_output(&body, &task);
+        assert_eq!(output.len(), 4096);
+    }
+
+    #[test]
+    fn format_delivery_output_multibyte_truncation() {
+        let task = HeartbeatTask {
+            text: "T".into(),
+            priority: TaskPriority::Low,
+            status: TaskStatus::Active,
+        };
+        // Build body of multi-byte chars that will exceed 4096 when combined with header
+        let body = "€".repeat(2000); // each € = 3 bytes, 6000 bytes total
+        let output = HeartbeatEngine::format_delivery_output(&body, &task);
+        assert!(output.len() <= 4096);
+        // Must be valid UTF-8
+        let _ = output.as_str();
+    }
+
+    #[test]
+    fn format_delivery_output_preserves_body_content() {
+        let task = HeartbeatTask {
+            text: "Check email".into(),
+            priority: TaskPriority::High,
+            status: TaskStatus::Active,
+        };
+        let output = HeartbeatEngine::format_delivery_output(
+            "**Status:** completed\n**Summary:** All good",
+            &task,
+        );
+        assert!(output.contains("[high] Check email"));
+        assert!(output.contains("**Status:** completed"));
+        assert!(output.contains("**Summary:** All good"));
+    }
+
+    #[test]
+    fn format_delivery_output_strips_surrounding_whitespace() {
+        let task = HeartbeatTask {
+            text: "Task".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        let output = HeartbeatEngine::format_delivery_output("  result  \n\n", &task);
+        assert!(output.contains("\n\nresult"));
+    }
+
+    #[test]
+    fn format_delivery_output_all_priorities() {
+        for (priority, label) in [
+            (TaskPriority::High, "[high]"),
+            (TaskPriority::Medium, "[medium]"),
+            (TaskPriority::Low, "[low]"),
+        ] {
+            let task = HeartbeatTask {
+                text: "X".into(),
+                priority,
+                status: TaskStatus::Active,
+            };
+            let output = HeartbeatEngine::format_delivery_output("ok", &task);
+            assert!(output.starts_with(label), "Expected {label} prefix");
+        }
+    }
+
+    // ── decision prompt additional tests ─────────────────────────
+
+    #[test]
+    fn decision_prompt_empty_tasks() {
+        let prompt = HeartbeatEngine::build_decision_prompt(&[]);
+        assert!(prompt.contains("Tasks:"));
+        assert!(prompt.contains("Do not explain"));
+    }
+
+    #[test]
+    fn decision_prompt_single_task() {
+        let tasks = vec![HeartbeatTask {
+            text: "Only task".into(),
+            priority: TaskPriority::Low,
+            status: TaskStatus::Active,
+        }];
+        let prompt = HeartbeatEngine::build_decision_prompt(&tasks);
+        assert!(prompt.contains("1. [low] Only task"));
+        assert!(!prompt.contains("2."));
+    }
+
+    // ── is_runnable tests ───────────────────────────────────────
+
+    #[test]
+    fn is_runnable_active() {
+        let task = HeartbeatTask {
+            text: "T".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Active,
+        };
+        assert!(task.is_runnable());
+    }
+
+    #[test]
+    fn is_runnable_paused() {
+        let task = HeartbeatTask {
+            text: "T".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Paused,
+        };
+        assert!(!task.is_runnable());
+    }
+
+    #[test]
+    fn is_runnable_completed() {
+        let task = HeartbeatTask {
+            text: "T".into(),
+            priority: TaskPriority::Medium,
+            status: TaskStatus::Completed,
+        };
+        assert!(!task.is_runnable());
+    }
+
+    // ── Display impls ───────────────────────────────────────────
+
+    #[test]
+    fn task_priority_display() {
+        assert_eq!(format!("{}", TaskPriority::Low), "low");
+        assert_eq!(format!("{}", TaskPriority::Medium), "medium");
+        assert_eq!(format!("{}", TaskPriority::High), "high");
+    }
+
+    #[test]
+    fn task_status_display() {
+        assert_eq!(format!("{}", TaskStatus::Active), "active");
+        assert_eq!(format!("{}", TaskStatus::Paused), "paused");
+        assert_eq!(format!("{}", TaskStatus::Completed), "completed");
+    }
+
+    #[test]
+    fn task_display_all_priorities() {
+        for (p, label) in [
+            (TaskPriority::Low, "[low] T"),
+            (TaskPriority::Medium, "[medium] T"),
+            (TaskPriority::High, "[high] T"),
+        ] {
+            let task = HeartbeatTask {
+                text: "T".into(),
+                priority: p,
+                status: TaskStatus::Active,
+            };
+            assert_eq!(format!("{task}"), label);
+        }
     }
 }

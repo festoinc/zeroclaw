@@ -359,7 +359,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         let mut tick_had_error = false;
         for task in &tasks_to_run {
             let task_start = std::time::Instant::now();
-            let prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
+            let prompt =
+                HeartbeatEngine::build_task_prompt(task, config.heartbeat.prompt_prefix.as_deref());
             let temp = config.default_temperature;
             match Box::pin(crate::agent::run(
                 config.clone(),
@@ -370,7 +371,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 vec![],
                 false,
                 None,
-                None,
+                config.heartbeat.allowed_tools.clone(),
             ))
             .await
             {
@@ -390,11 +391,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         duration_ms,
                         config.heartbeat.max_run_history,
                     );
-                    let announcement = if output.trim().is_empty() {
-                        format!("💓 heartbeat task completed: {}", task.text)
-                    } else {
-                        output
-                    };
+                    let announcement = HeartbeatEngine::format_delivery_output(&output, task);
                     if let Some((channel, target)) = &delivery {
                         if let Err(e) = crate::cron::scheduler::deliver_announcement(
                             &config,
@@ -782,6 +779,315 @@ mod tests {
         let config = Config::default();
         let target = auto_detect_heartbeat_channel(&config);
         assert!(target.is_none());
+    }
+
+    // ── resolve_heartbeat_delivery edge cases ─────────────────
+
+    #[test]
+    fn resolve_delivery_whitespace_only_target() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("  ".into());
+        config.heartbeat.to = Some("123".into());
+        // Whitespace target → treated as None → (None, Some) → error
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(err.to_string().contains("heartbeat.target is required"));
+    }
+
+    #[test]
+    fn resolve_delivery_whitespace_only_to() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram".into());
+        config.heartbeat.to = Some("  ".into());
+        // Whitespace to → treated as None → (Some, None) → error
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(err.to_string().contains("heartbeat.to is required"));
+    }
+
+    #[test]
+    fn resolve_delivery_both_whitespace() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("  ".into());
+        config.heartbeat.to = Some("  ".into());
+        // Both whitespace → (None, None) → auto-detect → None (no channels)
+        let result = resolve_heartbeat_delivery(&config).unwrap();
+        assert!(result.is_none());
+    }
+
+    // ── auto_detect_heartbeat_channel edge cases ────────────────
+
+    #[test]
+    fn auto_detect_telegram_empty_allowed_users() {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "token".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        // No users → target would be empty → returns None
+        let result = auto_detect_heartbeat_channel(&config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn auto_detect_discord_only() {
+        let mut config = Config::default();
+        config.channels_config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "token".into(),
+            guild_id: None,
+            allowed_users: vec!["user".into()],
+            listen_to_bots: false,
+            mention_only: false,
+        });
+        // Discord requires explicit target
+        let result = auto_detect_heartbeat_channel(&config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn auto_detect_telegram_priority_over_discord() {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "token".into(),
+            allowed_users: vec!["tg_user".into()],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.channels_config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "token".into(),
+            guild_id: None,
+            allowed_users: vec!["disc_user".into()],
+            listen_to_bots: false,
+            mention_only: false,
+        });
+        let result = auto_detect_heartbeat_channel(&config);
+        assert_eq!(
+            result,
+            Some(("telegram".to_string(), "tg_user".to_string()))
+        );
+    }
+
+    // ── validate_heartbeat_channel_config edge cases ────────────
+
+    #[test]
+    fn validate_channel_case_insensitive() {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "token".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        // "Telegram" with uppercase T should pass
+        assert!(validate_heartbeat_channel_config(&config, "Telegram").is_ok());
+    }
+
+    #[test]
+    fn validate_channel_unsupported() {
+        let config = Config::default();
+        let err = validate_heartbeat_channel_config(&config, "whatsapp").unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn validate_channel_not_configured() {
+        let config = Config::default();
+        let err = validate_heartbeat_channel_config(&config, "discord").unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn validate_channel_slack_not_configured() {
+        let config = Config::default();
+        let err = validate_heartbeat_channel_config(&config, "slack").unwrap_err();
+        assert!(err.to_string().contains("slack"));
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn validate_channel_mattermost_not_configured() {
+        let config = Config::default();
+        let err = validate_heartbeat_channel_config(&config, "mattermost").unwrap_err();
+        assert!(err.to_string().contains("mattermost"));
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn validate_channel_empty_string() {
+        let config = Config::default();
+        let err = validate_heartbeat_channel_config(&config, "").unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn validate_channel_telegram_configured_ok() {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "token".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        assert!(validate_heartbeat_channel_config(&config, "telegram").is_ok());
+    }
+
+    #[test]
+    fn validate_channel_discord_configured_ok() {
+        let mut config = Config::default();
+        config.channels_config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "token".into(),
+            guild_id: None,
+            allowed_users: vec![],
+            listen_to_bots: false,
+            mention_only: false,
+        });
+        assert!(validate_heartbeat_channel_config(&config, "discord").is_ok());
+    }
+
+    // ── auto_detect_heartbeat_channel additional edge cases ──────
+
+    #[test]
+    fn auto_detect_slack_only() {
+        let mut config = Config::default();
+        config.channels_config.slack = Some(crate::config::schema::SlackConfig {
+            bot_token: "token".into(),
+            app_token: Some("app".into()),
+            channel_id: None,
+            allowed_users: vec!["user".into()],
+            interrupt_on_new_message: false,
+        });
+        // Slack requires explicit target
+        let result = auto_detect_heartbeat_channel(&config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn auto_detect_mattermost_only() {
+        let mut config = Config::default();
+        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: "https://mm.example.com".into(),
+            bot_token: "token".into(),
+            channel_id: None,
+            allowed_users: vec!["user".into()],
+            thread_replies: None,
+            mention_only: None,
+        });
+        // Mattermost requires explicit target
+        let result = auto_detect_heartbeat_channel(&config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn auto_detect_telegram_multiple_users_picks_first() {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "token".into(),
+            allowed_users: vec!["first_user".into(), "second_user".into()],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        let result = auto_detect_heartbeat_channel(&config);
+        assert_eq!(
+            result,
+            Some(("telegram".to_string(), "first_user".to_string()))
+        );
+    }
+
+    // ── resolve_heartbeat_delivery additional edge cases ─────────
+
+    #[test]
+    fn resolve_delivery_empty_string_target() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some(String::new());
+        config.heartbeat.to = Some("123".into());
+        // Empty string target → trimmed to empty → filtered to None → (None, Some) → error
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(err.to_string().contains("heartbeat.target is required"));
+    }
+
+    #[test]
+    fn resolve_delivery_empty_string_to() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram".into());
+        config.heartbeat.to = Some(String::new());
+        // Empty string to → trimmed to empty → filtered to None → (Some, None) → error
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(err.to_string().contains("heartbeat.to is required"));
+    }
+
+    #[test]
+    fn resolve_delivery_both_empty_strings() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some(String::new());
+        config.heartbeat.to = Some(String::new());
+        // Both empty → (None, None) → auto-detect → None
+        let result = resolve_heartbeat_delivery(&config).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_delivery_discord_configured() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("discord".into());
+        config.heartbeat.to = Some("channel-id".into());
+        config.channels_config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "token".into(),
+            guild_id: None,
+            allowed_users: vec![],
+            listen_to_bots: false,
+            mention_only: false,
+        });
+        let result = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            result,
+            Some(("discord".to_string(), "channel-id".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_slack_configured() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("slack".into());
+        config.heartbeat.to = Some("C123456".into());
+        config.channels_config.slack = Some(crate::config::schema::SlackConfig {
+            bot_token: "token".into(),
+            app_token: Some("app".into()),
+            channel_id: None,
+            allowed_users: vec![],
+            interrupt_on_new_message: false,
+        });
+        let result = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(result, Some(("slack".to_string(), "C123456".to_string())));
+    }
+
+    #[test]
+    fn resolve_delivery_mattermost_configured() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("mattermost".into());
+        config.heartbeat.to = Some("chan-id".into());
+        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: "https://mm.example.com".into(),
+            bot_token: "token".into(),
+            channel_id: None,
+            allowed_users: vec![],
+            thread_replies: None,
+            mention_only: None,
+        });
+        let result = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            result,
+            Some(("mattermost".to_string(), "chan-id".to_string()))
+        );
     }
 
     /// Verify that SIGHUP does not cause shutdown — the daemon should ignore it

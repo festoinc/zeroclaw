@@ -3406,6 +3406,13 @@ pub struct HeartbeatConfig {
     /// Maximum number of heartbeat run history records to retain. Default: `100`.
     #[serde(default = "default_heartbeat_max_run_history")]
     pub max_run_history: u32,
+    /// Optional prompt prefix prepended to heartbeat task prompts.
+    #[serde(default)]
+    pub prompt_prefix: Option<String>,
+    /// Optional allowlist of tool names the heartbeat agent may use.
+    /// When `None`, all tools are available.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 fn default_two_phase() -> bool {
@@ -3440,6 +3447,8 @@ impl Default for HeartbeatConfig {
             deadman_channel: None,
             deadman_to: None,
             max_run_history: default_heartbeat_max_run_history(),
+            prompt_prefix: None,
+            allowed_tools: None,
         }
     }
 }

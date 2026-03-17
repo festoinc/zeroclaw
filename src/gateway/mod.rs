@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod api_pairing;
+pub mod control_plane;
 pub mod nodes;
 pub mod sse;
 pub mod static_files;
@@ -339,6 +340,8 @@ pub struct AppState {
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
+    /// Control plane for multi-node orchestration (None if nodes.enabled is false)
+    pub control_plane: Option<Arc<control_plane::ControlPlane>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -704,6 +707,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
+    // Control plane for multi-node orchestration
+    let control_plane = if config.nodes.enabled {
+        Some(Arc::new(control_plane::ControlPlane::new(
+            config.nodes.max_nodes,
+            event_tx.clone(),
+        )))
+    } else {
+        None
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -732,6 +745,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         session_backend,
         device_registry,
         pending_pairings,
+        control_plane,
     };
 
     // Config PUT needs larger body limit (1MB)

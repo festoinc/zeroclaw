@@ -6088,15 +6088,16 @@ impl Default for NotionConfig {
     }
 }
 
-/// Jira integration configuration (`[jira]`).
+/// Jira & Confluence integration configuration (`[jira]`).
 ///
-/// When `enabled = true`, registers the `jira` tool which can get tickets,
-/// search with JQL, and add comments.
+/// When `enabled = true`, registers the `jira` tool which can manage Jira tickets
+/// and Confluence pages.
 ///
 /// ## Defaults
 /// - `enabled`: `false`
 /// - `allowed_actions`: `["get_ticket"]` — read-only by default.
-///   Add `"search_tickets"`, `"comment_ticket"`, `"list_projects"`, or `"myself"` to unlock them.
+///   Add `"search_tickets"`, `"comment_ticket"`, `"list_projects"`, `"myself"`,
+///   `"confluence_get_space"`, `"confluence_get_page"`, or `"confluence_search"` to unlock them.
 /// - `timeout_secs`: `30`
 ///
 /// ## Auth
@@ -6110,13 +6111,23 @@ pub struct JiraConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Actions the agent is permitted to call.
-    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`, `"list_projects"`, `"myself"`.
+    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`, `"list_projects"`,
+    /// `"myself"`, `"confluence_get_space"`, `"confluence_get_page"`, `"confluence_search"`.
     /// Defaults to `["get_ticket"]` (read-only).
     #[serde(default = "default_jira_allowed_actions")]
     pub allowed_actions: Vec<String>,
     /// Request timeout in seconds. Default: `30`.
     #[serde(default = "default_jira_timeout_secs")]
     pub timeout_secs: u64,
+    /// Base URL read from `JIRA_BASE_URL` env var. Populated by `apply_env_overrides`, never serialised.
+    #[serde(skip)]
+    pub base_url: String,
+    /// Email read from `JIRA_EMAIL` env var. Populated by `apply_env_overrides`, never serialised.
+    #[serde(skip)]
+    pub email: String,
+    /// API token read from `JIRA_API_TOKEN` env var. Populated by `apply_env_overrides`, never serialised.
+    #[serde(skip)]
+    pub api_token: String,
 }
 
 fn default_jira_allowed_actions() -> Vec<String> {
@@ -6133,6 +6144,9 @@ impl Default for JiraConfig {
             enabled: false,
             allowed_actions: default_jira_allowed_actions(),
             timeout_secs: default_jira_timeout_secs(),
+            base_url: String::new(),
+            email: String::new(),
+            api_token: String::new(),
         }
     }
 }
@@ -7947,32 +7961,14 @@ impl Config {
 
         // Jira
         if self.jira.enabled {
-            if std::env::var("JIRA_BASE_URL")
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-            {
-                anyhow::bail!(
-                    "JIRA_BASE_URL env var must be set when jira.enabled = true"
-                );
+            if self.jira.base_url.is_empty() {
+                anyhow::bail!("JIRA_BASE_URL env var must be set when jira.enabled = true");
             }
-            if std::env::var("JIRA_EMAIL")
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-            {
-                anyhow::bail!(
-                    "JIRA_EMAIL env var must be set when jira.enabled = true"
-                );
+            if self.jira.email.is_empty() {
+                anyhow::bail!("JIRA_EMAIL env var must be set when jira.enabled = true");
             }
-            if std::env::var("JIRA_API_TOKEN")
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-            {
-                anyhow::bail!(
-                    "JIRA_API_TOKEN env var must be set when jira.enabled = true"
-                );
+            if self.jira.api_token.is_empty() {
+                anyhow::bail!("JIRA_API_TOKEN env var must be set when jira.enabled = true");
             }
             let valid_actions = [
                 "get_ticket",
@@ -8412,6 +8408,23 @@ impl Config {
                  implemented; this section is reserved for future use and will be ignored"
             );
         }
+
+        // Jira/Confluence credentials (env-only; never stored in config.toml)
+        if let Ok(v) = std::env::var("JIRA_BASE_URL") {
+            if !v.trim().is_empty() {
+                self.jira.base_url = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("JIRA_EMAIL") {
+            if !v.trim().is_empty() {
+                self.jira.email = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("JIRA_API_TOKEN") {
+            if !v.trim().is_empty() {
+                self.jira.api_token = v.trim().to_string();
+            }
+        }
     }
 
     async fn resolve_config_path_for_save(&self) -> Result<PathBuf> {
@@ -8771,8 +8784,6 @@ impl Config {
                 "config.notion.api_key",
             )?;
         }
-
-
 
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;

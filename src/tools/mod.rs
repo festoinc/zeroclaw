@@ -444,20 +444,23 @@ pub fn all_tools_with_runtime(
 
     // Jira integration (config-gated)
     if root_config.jira.enabled {
-        let base_url = std::env::var("JIRA_BASE_URL").unwrap_or_default();
-        let email = std::env::var("JIRA_EMAIL").unwrap_or_default();
-        let api_token = std::env::var("JIRA_API_TOKEN").unwrap_or_default();
-        if base_url.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but JIRA_BASE_URL env var is not set — skipping registration");
-        } else if email.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but JIRA_EMAIL env var is not set — skipping registration");
-        } else if api_token.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but JIRA_API_TOKEN env var is not set — skipping registration");
+        if root_config.jira.base_url.is_empty() {
+            tracing::warn!(
+                "Jira tool enabled but JIRA_BASE_URL env var is not set — skipping registration"
+            );
+        } else if root_config.jira.email.is_empty() {
+            tracing::warn!(
+                "Jira tool enabled but JIRA_EMAIL env var is not set — skipping registration"
+            );
+        } else if root_config.jira.api_token.is_empty() {
+            tracing::warn!(
+                "Jira tool enabled but JIRA_API_TOKEN env var is not set — skipping registration"
+            );
         } else {
             tool_arcs.push(Arc::new(JiraTool::new(
-                base_url.trim().to_string(),
-                email.trim().to_string(),
-                api_token.trim().to_string(),
+                root_config.jira.base_url.clone(),
+                root_config.jira.email.clone(),
+                root_config.jira.api_token.clone(),
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,

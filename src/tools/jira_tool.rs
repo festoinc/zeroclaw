@@ -487,7 +487,7 @@ impl JiraTool {
 
         let tree: Vec<Value> = roots
             .iter()
-            .map(|r| build_confluence_tree(r, &id_to_title, &parent_to_children))
+            .map(|r| build_confluence_tree(r, &id_to_title, &parent_to_children, 0))
             .collect();
 
         let output = json!({
@@ -584,10 +584,8 @@ impl JiraTool {
         max_results: Option<u32>,
     ) -> anyhow::Result<ToolResult> {
         let max_results = max_results.unwrap_or(25).clamp(1, 50);
-        let escaped = query.replace('"', "\\\"");
-        let cql = format!(
-            "(title ~ \"{escaped}\" OR text ~ \"{escaped}\") AND type = page"
-        );
+        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+        let cql = format!("(title ~ \"{escaped}\" OR text ~ \"{escaped}\") AND type = page");
         let limit_str = max_results.to_string();
         let url = format!("{}/wiki/rest/api/content/search", self.base_url);
 
@@ -872,9 +870,7 @@ impl Tool for JiraTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "confluence_get_space requires space_key parameter".into(),
-                            ),
+                            error: Some("confluence_get_space requires space_key parameter".into()),
                         })
                     }
                 };
@@ -887,9 +883,7 @@ impl Tool for JiraTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "confluence_get_page requires page_id parameter".into(),
-                            ),
+                            error: Some("confluence_get_page requires page_id parameter".into()),
                         })
                     }
                 };
@@ -1283,13 +1277,17 @@ fn build_confluence_tree(
     node_id: &str,
     id_to_title: &HashMap<String, String>,
     parent_to_children: &HashMap<String, Vec<String>>,
+    depth: u32,
 ) -> Value {
     let title = id_to_title.get(node_id).map(String::as_str).unwrap_or("");
+    if depth >= 50 {
+        return json!({ "id": node_id, "title": title, "children": [] });
+    }
     let children: Vec<Value> = parent_to_children
         .get(node_id)
         .map(|kids| {
             kids.iter()
-                .map(|k| build_confluence_tree(k, id_to_title, parent_to_children))
+                .map(|k| build_confluence_tree(k, id_to_title, parent_to_children, depth + 1))
                 .collect()
         })
         .unwrap_or_default();
@@ -2026,7 +2024,7 @@ mod tests {
         let mut id_to_title = HashMap::new();
         id_to_title.insert("1".to_string(), "Root".to_string());
         let parent_to_children = HashMap::new();
-        let tree = build_confluence_tree("1", &id_to_title, &parent_to_children);
+        let tree = build_confluence_tree("1", &id_to_title, &parent_to_children, 0);
         assert_eq!(tree["id"], "1");
         assert_eq!(tree["title"], "Root");
         assert_eq!(tree["children"].as_array().unwrap().len(), 0);
@@ -2041,7 +2039,7 @@ mod tests {
         let mut parent_to_children = HashMap::new();
         parent_to_children.insert("1".to_string(), vec!["2".to_string()]);
         parent_to_children.insert("2".to_string(), vec!["3".to_string()]);
-        let tree = build_confluence_tree("1", &id_to_title, &parent_to_children);
+        let tree = build_confluence_tree("1", &id_to_title, &parent_to_children, 0);
         let children = tree["children"].as_array().unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0]["id"], "2");

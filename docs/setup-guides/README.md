@@ -27,6 +27,10 @@ For first-time setup and quick orientation.
 - Ollama cloud models (`:cloud`) require a remote `api_url` and API key (for example `api_url = "https://ollama.com"`).
 - Validate environment: `zeroclaw status` + `zeroclaw doctor`
 
+## Integration Guides
+
+- [jira-setup.md](jira-setup.md) — Jira & Confluence integration (API token, allowed actions)
+
 ## Next
 
 - Runtime operations: [../ops/README.md](../ops/README.md)

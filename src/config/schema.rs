@@ -7979,12 +7979,18 @@ impl Config {
                     "jira.api_token must be set (or JIRA_API_TOKEN env var) when jira.enabled = true"
                 );
             }
-            let valid_actions = ["get_ticket", "search_tickets", "comment_ticket"];
+            let valid_actions = [
+                "get_ticket",
+                "search_tickets",
+                "comment_ticket",
+                "list_projects",
+                "myself",
+            ];
             for action in &self.jira.allowed_actions {
                 if !valid_actions.contains(&action.as_str()) {
                     anyhow::bail!(
                         "jira.allowed_actions contains unknown action: '{}'. \
-                         Valid: get_ticket, search_tickets, comment_ticket",
+                         Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself",
                         action
                     );
                 }

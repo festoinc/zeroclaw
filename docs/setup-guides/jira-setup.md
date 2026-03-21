@@ -1,9 +1,12 @@
-# Jira Setup
+# Jira & Confluence Setup
 
-ZeroClaw supports Jira Cloud via the REST API v3, allowing the agent to read
-tickets, search with JQL, add comments, list projects, and verify credentials.
+ZeroClaw supports Jira Cloud and Confluence Cloud via the Atlassian REST API,
+allowing the agent to read tickets, search with JQL, add comments, list projects,
+verify credentials, and navigate Confluence spaces and pages.
 
 ## Overview
+
+### Jira Actions
 
 | Action | Description | Mutating |
 |--------|-------------|----------|
@@ -12,6 +15,14 @@ tickets, search with JQL, add comments, list projects, and verify credentials.
 | `list_projects` | List projects and their statuses/members | No |
 | `myself` | Verify credentials and return account info | No |
 | `comment_ticket` | Post a comment (supports @mentions and **bold**) | Yes |
+
+### Confluence Actions
+
+| Action | Description | Mutating |
+|--------|-------------|----------|
+| `confluence_get_space` | List all pages in a space as a parent/child tree (up to 1000) | No |
+| `confluence_get_page` | Read page content with parent and child navigation links | No |
+| `confluence_search` | Fuzzy search pages by title and body text | No |
 
 ## Setup
 
@@ -31,7 +42,7 @@ JIRA_API_TOKEN=your-jira-api-token
 
 Never put credentials in `config.toml` — use `.env` only.
 
-### 3. Enable Jira in `config.toml`
+### 3. Enable in `config.toml`
 
 ```toml
 [jira]
@@ -41,10 +52,17 @@ timeout_secs = 30
 ```
 
 `get_ticket` is the safe read-only default. Add other actions only as needed:
+
+**Jira:**
 - `search_tickets` — JQL search, read-only
 - `list_projects` — lists all projects and assignable users, read-only
 - `myself` — verifies credentials, read-only
 - `comment_ticket` — posts comments, **mutating** (requires Act policy)
+
+**Confluence:**
+- `confluence_get_space` — lists all pages in a space as a tree, read-only
+- `confluence_get_page` — reads page content with parent and child links, read-only
+- `confluence_search` — fuzzy search by title and body, read-only
 
 ## Verify Setup
 
@@ -107,6 +125,42 @@ Returns all projects with their issue types, workflow statuses, and assignable u
 Returns your account ID, display name, email, and active status. Useful for verifying
 that credentials are valid and the Jira connection is working.
 
+## Confluence Actions
+
+The same credentials (`JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`) are used for
+Confluence — no additional setup required.
+
+### `confluence_get_space`
+
+Returns all pages in a Confluence space as a parent/child tree. Requires the `space_key`
+parameter (e.g. `DP`, `ENG`).
+
+- Up to 1000 pages returned; response includes `truncated: true` if the space has more
+- Each node in the tree has `id`, `title`, and nested `children`
+
+Example: `action=confluence_get_space, space_key=DP`
+
+### `confluence_get_page`
+
+Reads a single Confluence page by its numeric ID. Returns:
+- `content` — page body as plain text (HTML stripped, capped at 10,000 characters)
+- `truncated` — `true` if the full content was longer than 10,000 characters
+- `parent` — `{id, title}` of the direct parent page, or `null` for root pages
+- `children` — up to 250 child pages as `[{id, title}]`
+- `children_truncated` — `true` if the page has more than 250 children
+
+Example: `action=confluence_get_page, page_id=123456789`
+
+### `confluence_search`
+
+Fuzzy-searches Confluence pages by title and body text using CQL
+(`title ~ "X" OR text ~ "X"`). Requires the `query` parameter.
+
+- Returns up to 50 results by default; override with `max_results` (max 50)
+- Each result includes `id`, `title`, `type`, and `space_key`
+
+Example: `action=confluence_search, query=onboarding template`
+
 ## Troubleshooting
 
 ### `JIRA_BASE_URL env var must be set`
@@ -118,7 +172,8 @@ before starting ZeroClaw.
 ### `jira.allowed_actions contains unknown action`
 
 The action name in `config.toml` is misspelled. Valid values:
-`get_ticket`, `search_tickets`, `comment_ticket`, `list_projects`, `myself`.
+`get_ticket`, `search_tickets`, `comment_ticket`, `list_projects`, `myself`,
+`confluence_get_space`, `confluence_get_page`, `confluence_search`.
 
 ### 401 Unauthorized
 

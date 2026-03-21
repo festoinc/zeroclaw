@@ -50,6 +50,10 @@ fn require_auth(
 pub struct MemoryQuery {
     pub query: Option<String>,
     pub category: Option<String>,
+    /// Filter memories created at or after (RFC 3339 / ISO 8601)
+    pub since: Option<String>,
+    /// Filter memories created at or before (RFC 3339 / ISO 8601)
+    pub until: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -633,9 +637,12 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
-    if let Some(ref query) = params.query {
-        // Search mode
-        match state.mem.recall(query, 50, None).await {
+    // Use recall when query or time range is provided
+    if params.query.is_some() || params.since.is_some() || params.until.is_some() {
+        let query = params.query.as_deref().unwrap_or("");
+        let since = params.since.as_deref();
+        let until = params.until.as_deref();
+        match state.mem.recall(query, 50, None, since, until).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1356,6 +1363,8 @@ mod tests {
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1457,6 +1466,7 @@ mod tests {
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
             allowed_numbers: vec![],
+            proxy_url: None,
         });
         cfg.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_aabbcc".to_string(),
@@ -1466,6 +1476,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
@@ -1591,6 +1602,7 @@ mod tests {
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
             allowed_numbers: vec![],
+            proxy_url: None,
         });
         current.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_current".to_string(),
@@ -1600,6 +1612,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),

@@ -20,6 +20,7 @@ pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
 pub mod calculator;
+pub mod claude_code;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -92,6 +93,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
 pub use calculator::CalculatorTool;
+pub use claude_code::ClaudeCodeTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
@@ -527,6 +529,14 @@ pub fn all_tools_with_runtime(
         );
     }
 
+    // Claude Code delegation tool
+    if root_config.claude_code.enabled {
+        tool_arcs.push(Arc::new(ClaudeCodeTool::new(
+            security.clone(),
+            root_config.claude_code.clone(),
+        )));
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
@@ -668,7 +678,8 @@ pub fn all_tools_with_runtime(
         )
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone())
-        .with_delegate_config(root_config.delegate.clone());
+        .with_delegate_config(root_config.delegate.clone())
+        .with_workspace_dir(workspace_dir.to_path_buf());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
@@ -999,6 +1010,7 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
 

@@ -371,6 +371,10 @@ pub struct Config {
     /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]`).
     #[serde(default)]
     pub verifiable_intent: VerifiableIntentConfig,
+
+    /// Claude Code tool configuration (`[claude_code]`).
+    #[serde(default)]
+    pub claude_code: ClaudeCodeConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -515,6 +519,10 @@ pub struct DelegateAgentConfig {
     /// When `None`, falls back to `[delegate].agentic_timeout_secs` (default: 300).
     #[serde(default)]
     pub agentic_timeout_secs: Option<u64>,
+    /// Optional skills directory path (relative to workspace root) for scoped skill loading.
+    /// When unset or empty, the sub-agent falls back to the default workspace `skills/` directory.
+    #[serde(default)]
+    pub skills_directory: Option<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -1644,6 +1652,12 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub trust_forwarded_headers: bool,
 
+    /// Optional URL path prefix for reverse-proxy deployments.
+    /// When set, all gateway routes are served under this prefix.
+    /// Must start with `/` and must not end with `/`.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+
     /// Maximum distinct client keys tracked by gateway rate limiter maps.
     #[serde(default = "default_gateway_rate_limit_max_keys")]
     pub rate_limit_max_keys: usize,
@@ -1716,6 +1730,7 @@ impl Default for GatewayConfig {
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
             trust_forwarded_headers: false,
+            path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
@@ -2907,6 +2922,60 @@ impl Default for ImageProviderFluxConfig {
     }
 }
 
+// ── Claude Code ─────────────────────────────────────────────────
+
+/// Claude Code CLI tool configuration (`[claude_code]` section).
+///
+/// Delegates coding tasks to the `claude -p` CLI. Authentication uses the
+/// binary's own OAuth session (Max subscription) by default — no API key
+/// needed unless `env_passthrough` includes `ANTHROPIC_API_KEY`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ClaudeCodeConfig {
+    /// Enable the `claude_code` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_claude_code_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Claude Code tools the subprocess is allowed to use
+    #[serde(default = "default_claude_code_allowed_tools")]
+    pub allowed_tools: Vec<String>,
+    /// Optional system prompt appended to Claude Code invocations
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_claude_code_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the claude subprocess (e.g. ANTHROPIC_API_KEY for API-key billing)
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_claude_code_timeout_secs() -> u64 {
+    600
+}
+
+fn default_claude_code_allowed_tools() -> Vec<String> {
+    vec!["Read".into(), "Edit".into(), "Bash".into(), "Write".into()]
+}
+
+fn default_claude_code_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_claude_code_timeout_secs(),
+            allowed_tools: default_claude_code_allowed_tools(),
+            system_prompt: None,
+            max_output_bytes: default_claude_code_max_output_bytes(),
+            env_passthrough: Vec::new(),
+        }
+    }
+}
+
 // ── Proxy ───────────────────────────────────────────────────────
 
 /// Proxy application scope — determines which outbound traffic uses the proxy.
@@ -3412,6 +3481,116 @@ pub fn build_runtime_proxy_client_with_timeouts(
     });
     set_runtime_proxy_cached_client(cache_key, client.clone());
     client
+}
+
+/// Build an HTTP client for a channel, using an explicit per-channel proxy URL
+/// when configured.  Falls back to the global runtime proxy when `proxy_url` is
+/// `None` or empty.
+pub fn build_channel_proxy_client(service_key: &str, proxy_url: Option<&str>) -> reqwest::Client {
+    match normalize_proxy_url_option(proxy_url) {
+        Some(url) => build_explicit_proxy_client(service_key, &url, None, None),
+        None => build_runtime_proxy_client(service_key),
+    }
+}
+
+/// Build an HTTP client for a channel with custom timeouts, using an explicit
+/// per-channel proxy URL when configured.  Falls back to the global runtime
+/// proxy when `proxy_url` is `None` or empty.
+pub fn build_channel_proxy_client_with_timeouts(
+    service_key: &str,
+    proxy_url: Option<&str>,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    match normalize_proxy_url_option(proxy_url) {
+        Some(url) => build_explicit_proxy_client(
+            service_key,
+            &url,
+            Some(timeout_secs),
+            Some(connect_timeout_secs),
+        ),
+        None => build_runtime_proxy_client_with_timeouts(
+            service_key,
+            timeout_secs,
+            connect_timeout_secs,
+        ),
+    }
+}
+
+/// Apply an explicit proxy URL to a `reqwest::ClientBuilder`, returning the
+/// modified builder.  Used by channels that specify a per-channel `proxy_url`.
+pub fn apply_channel_proxy_to_builder(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+    proxy_url: Option<&str>,
+) -> reqwest::ClientBuilder {
+    match normalize_proxy_url_option(proxy_url) {
+        Some(url) => apply_explicit_proxy_to_builder(builder, service_key, &url),
+        None => apply_runtime_proxy_to_builder(builder, service_key),
+    }
+}
+
+/// Build a client with a single explicit proxy URL (http+https via `Proxy::all`).
+fn build_explicit_proxy_client(
+    service_key: &str,
+    proxy_url: &str,
+    timeout_secs: Option<u64>,
+    connect_timeout_secs: Option<u64>,
+) -> reqwest::Client {
+    let cache_key = format!(
+        "explicit|{}|{}|timeout={}|connect_timeout={}",
+        service_key.trim().to_ascii_lowercase(),
+        proxy_url,
+        timeout_secs
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        connect_timeout_secs
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let mut builder = reqwest::Client::builder();
+    if let Some(t) = timeout_secs {
+        builder = builder.timeout(std::time::Duration::from_secs(t));
+    }
+    if let Some(ct) = connect_timeout_secs {
+        builder = builder.connect_timeout(std::time::Duration::from_secs(ct));
+    }
+    builder = apply_explicit_proxy_to_builder(builder, service_key, proxy_url);
+    let client = builder.build().unwrap_or_else(|error| {
+        tracing::warn!(
+            service_key,
+            proxy_url,
+            "Failed to build channel proxy client: {error}"
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
+/// Apply a single explicit proxy URL to a builder via `Proxy::all`.
+fn apply_explicit_proxy_to_builder(
+    mut builder: reqwest::ClientBuilder,
+    service_key: &str,
+    proxy_url: &str,
+) -> reqwest::ClientBuilder {
+    match reqwest::Proxy::all(proxy_url) {
+        Ok(proxy) => {
+            builder = builder.proxy(proxy);
+        }
+        Err(error) => {
+            tracing::warn!(
+                proxy_url,
+                service_key,
+                "Ignoring invalid channel proxy_url: {error}"
+            );
+        }
+    }
+    builder
 }
 
 fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
@@ -4918,6 +5097,10 @@ pub struct TelegramConfig {
     /// explicitly, it takes precedence.
     #[serde(default)]
     pub ack_reactions: Option<bool>,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -4951,6 +5134,10 @@ pub struct DiscordConfig {
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
     pub mention_only: bool,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -4987,6 +5174,10 @@ pub struct SlackConfig {
     /// Direct messages remain allowed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for SlackConfig {
@@ -5022,6 +5213,10 @@ pub struct MattermostConfig {
     /// cancels the in-flight request and starts a fresh response with preserved history.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -5134,6 +5329,10 @@ pub struct SignalConfig {
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -5228,6 +5427,10 @@ pub struct WhatsAppConfig {
     /// user's own self-chat (Notes to Self). Defaults to false.
     #[serde(default)]
     pub self_chat_mode: bool,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -5276,6 +5479,10 @@ pub struct WatiConfig {
     /// Allowed phone numbers (E.164 format) or "*" for all.
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 fn default_wati_api_url() -> String {
@@ -5306,6 +5513,10 @@ pub struct NextcloudTalkConfig {
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for NextcloudTalkConfig {
@@ -5433,6 +5644,10 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -5467,6 +5682,10 @@ pub struct FeishuConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -5928,6 +6147,10 @@ pub struct DingTalkConfig {
     /// Allowed user IDs (staff IDs). Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for DingTalkConfig {
@@ -5968,6 +6191,10 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl ChannelConfig for QQConfig {
@@ -6548,6 +6775,7 @@ impl Default for Config {
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
+            claude_code: ClaudeCodeConfig::default(),
         }
     }
 }
@@ -7601,6 +7829,31 @@ impl Config {
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
+        }
+        if let Some(ref prefix) = self.gateway.path_prefix {
+            // Validate the raw value — no silent trimming so the stored
+            // value is exactly what was validated.
+            if !prefix.is_empty() {
+                if !prefix.starts_with('/') {
+                    anyhow::bail!("gateway.path_prefix must start with '/'");
+                }
+                if prefix.ends_with('/') {
+                    anyhow::bail!("gateway.path_prefix must not end with '/' (including bare '/')");
+                }
+                // Reject characters unsafe for URL paths or HTML/JS injection.
+                // Whitespace is intentionally excluded from the allowed set.
+                if let Some(bad) = prefix.chars().find(|c| {
+                    !matches!(c, '/' | '-' | '_' | '.' | '~'
+                        | 'a'..='z' | 'A'..='Z' | '0'..='9'
+                        | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+                        | ':' | '@')
+                }) {
+                    anyhow::bail!(
+                        "gateway.path_prefix contains invalid character '{bad}'; \
+                         only unreserved and sub-delim URI characters are allowed"
+                    );
+                }
+            }
         }
 
         // Autonomy
@@ -9377,6 +9630,7 @@ default_temperature = 0.7
                     interrupt_on_new_message: false,
                     mention_only: false,
                     ack_reactions: None,
+                    proxy_url: None,
                 }),
                 discord: None,
                 slack: None,
@@ -9449,6 +9703,7 @@ default_temperature = 0.7
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
+            claude_code: ClaudeCodeConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -9787,6 +10042,7 @@ tool_dispatcher = "xml"
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
+            claude_code: ClaudeCodeConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -9831,6 +10087,7 @@ tool_dispatcher = "xml"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
 
         config.agents.insert(
@@ -9847,6 +10104,7 @@ tool_dispatcher = "xml"
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
 
@@ -9972,6 +10230,7 @@ tool_dispatcher = "xml"
             interrupt_on_new_message: true,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -10000,6 +10259,7 @@ tool_dispatcher = "xml"
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -10016,6 +10276,7 @@ tool_dispatcher = "xml"
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -10117,6 +10378,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["+1111111111".into()],
             ignore_attachments: true,
             ignore_stories: false,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -10137,6 +10399,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["*".into()],
             ignore_attachments: false,
             ignore_stories: true,
+            proxy_url: None,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -10367,6 +10630,7 @@ channel_id = "C123"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -10391,6 +10655,7 @@ channel_id = "C123"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            proxy_url: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -10420,6 +10685,7 @@ channel_id = "C123"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            proxy_url: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -10441,6 +10707,7 @@ channel_id = "C123"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            proxy_url: None,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -10461,6 +10728,7 @@ channel_id = "C123"
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
             self_chat_mode: false,
+            proxy_url: None,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -10491,6 +10759,7 @@ channel_id = "C123"
                 dm_policy: WhatsAppChatPolicy::default(),
                 group_policy: WhatsAppChatPolicy::default(),
                 self_chat_mode: false,
+                proxy_url: None,
             }),
             linq: None,
             wati: None,
@@ -10595,6 +10864,7 @@ channel_id = "C123"
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
             trust_forwarded_headers: true,
+            path_prefix: Some("/zeroclaw".into()),
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
@@ -10612,6 +10882,7 @@ channel_id = "C123"
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
         assert!(parsed.trust_forwarded_headers);
+        assert_eq!(parsed.path_prefix.as_deref(), Some("/zeroclaw"));
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
@@ -11495,6 +11766,7 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         config.save().await.unwrap();
 
@@ -12206,6 +12478,7 @@ default_model = "persisted-profile"
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -12229,6 +12502,7 @@ default_model = "persisted-profile"
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            proxy_url: None,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -12275,6 +12549,7 @@ default_model = "persisted-profile"
             allowed_users: vec!["user_123".into(), "user_456".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -12295,6 +12570,7 @@ default_model = "persisted-profile"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            proxy_url: None,
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -12322,6 +12598,7 @@ default_model = "persisted-profile"
             app_token: "app-token".into(),
             webhook_secret: Some("webhook-secret".into()),
             allowed_users: vec!["user_a".into(), "*".into()],
+            proxy_url: None,
         };
 
         let json = serde_json::to_string(&nc).unwrap();
@@ -12554,6 +12831,7 @@ require_otp_to_resume = true
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         });
 
         // Save (triggers encryption)
